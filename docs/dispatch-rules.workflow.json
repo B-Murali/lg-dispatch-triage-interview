@@ -1,0 +1,260 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Dispatch Triage \u2014 Decision Rules",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "auto-dispatch",
+        "label": "Booked automatically",
+        "focus": [
+          "ticket",
+          "validate",
+          "triage",
+          "capacity",
+          "assign",
+          "finalize"
+        ],
+        "note": "A clean, serviceable ticket with room in the pool gets a technician."
+      },
+      {
+        "id": "short-circuit",
+        "label": "Rejected early",
+        "focus": [
+          "validate",
+          "triage",
+          "finalize"
+        ],
+        "note": "Invalid or unserviceable tickets go straight to finalize."
+      },
+      {
+        "id": "capacity",
+        "label": "Capacity and the depot",
+        "focus": [
+          "capacity",
+          "depot",
+          "queue"
+        ],
+        "note": "Free minutes decide between booking and human scheduling."
+      }
+    ],
+    "output": "docs/dispatch-rules.html",
+    "viewBox": [
+      1180,
+      660
+    ]
+  },
+  "lanes": [
+    {
+      "id": "graph",
+      "label": "Dispatch Graph"
+    },
+    {
+      "id": "downstream",
+      "label": "Depot Service"
+    },
+    {
+      "id": "human",
+      "label": "Human Scheduling",
+      "variant": "exception"
+    },
+    {
+      "id": "terminal",
+      "label": "Terminal Decision"
+    }
+  ],
+  "mainPath": [
+    "ticket",
+    "validate",
+    "triage",
+    "capacity",
+    "assign",
+    "finalize"
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "ticket"
+    ],
+    "allowedTerminals": [
+      "finalize"
+    ],
+    "requiredPaths": [
+      {
+        "from": "ticket",
+        "to": "finalize"
+      },
+      {
+        "from": "triage",
+        "to": "finalize"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "ticket",
+      "lane": "graph",
+      "col": 0,
+      "type": "external",
+      "label": "Work Order",
+      "sublabel": "issue + duration",
+      "width": 136
+    },
+    {
+      "id": "validate",
+      "lane": "graph",
+      "col": 1,
+      "type": "backend",
+      "label": "validate",
+      "sublabel": "structural checks",
+      "width": 136
+    },
+    {
+      "id": "triage",
+      "lane": "graph",
+      "col": 2,
+      "type": "backend",
+      "label": "triage",
+      "sublabel": "issue to severity",
+      "tag": "sets the pool",
+      "width": 136
+    },
+    {
+      "id": "capacity",
+      "lane": "graph",
+      "col": 3,
+      "type": "backend",
+      "label": "capacity_check",
+      "sublabel": "room for the job?",
+      "width": 136
+    },
+    {
+      "id": "depot",
+      "lane": "downstream",
+      "col": 3,
+      "type": "cloud",
+      "label": "Availability Service",
+      "sublabel": "free minutes today",
+      "tag": "fails closed",
+      "width": 148
+    },
+    {
+      "id": "assign",
+      "lane": "graph",
+      "col": 4,
+      "type": "backend",
+      "label": "assign_technician",
+      "sublabel": "reserve + stamp SLA",
+      "width": 148
+    },
+    {
+      "id": "queue",
+      "lane": "human",
+      "col": 4,
+      "type": "messagebus",
+      "label": "queue_for_scheduling",
+      "sublabel": "no technician held",
+      "width": 156
+    },
+    {
+      "id": "finalize",
+      "lane": "terminal",
+      "col": 5,
+      "type": "security",
+      "label": "finalize",
+      "sublabel": "the only decision point",
+      "tag": "every run ends here",
+      "width": 148
+    }
+  ],
+  "edges": [
+    {
+      "id": "intake-validate",
+      "from": "ticket",
+      "to": "validate",
+      "variant": "default"
+    },
+    {
+      "id": "validate-triage",
+      "from": "validate",
+      "to": "triage",
+      "variant": "default"
+    },
+    {
+      "id": "triage-capacity",
+      "from": "triage",
+      "to": "capacity",
+      "label": "serviceable",
+      "variant": "emphasis"
+    },
+    {
+      "id": "triage-reject",
+      "from": "triage",
+      "to": "finalize",
+      "label": "invalid or unserviceable",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "capacity-depot",
+      "from": "capacity",
+      "to": "depot",
+      "label": "site + pool",
+      "variant": "dashed"
+    },
+    {
+      "id": "depot-capacity",
+      "from": "depot",
+      "to": "capacity",
+      "label": "free minutes",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "capacity-assign",
+      "from": "capacity",
+      "to": "assign",
+      "label": "room to spare",
+      "variant": "emphasis"
+    },
+    {
+      "id": "capacity-queue",
+      "from": "capacity",
+      "to": "queue",
+      "label": "full or oversized",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "assign-finalize",
+      "from": "assign",
+      "to": "finalize",
+      "variant": "emphasis"
+    },
+    {
+      "id": "queue-finalize",
+      "from": "queue",
+      "to": "finalize",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Short-circuit rule",
+      "items": [
+        "Invalid or unserviceable tickets go straight to finalize",
+        "They never reach capacity_check: no depot lookup, no technician held"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Capacity and the depot",
+      "items": [
+        "Auto-dispatch needs free minutes >= duration + 30, and a job <= 240 min",
+        "Certified and general pools at a site have independent capacity"
+      ]
+    }
+  ]
+}
