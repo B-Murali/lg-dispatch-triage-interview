@@ -162,6 +162,9 @@ still free today for a **site *and* skill pool** pair.
 - The lookup **fails closed**: if the depot is unreachable, times out, or answers with a
   non-2xx or unparseable body, the answer is `0` free minutes, so the ticket falls through
   to `needs_scheduling`. A broken dependency must never book a technician.
+- A failed lookup is **never cached**. `0` is a fallback, not an answer: the next ticket
+  for that site + pool must ask the depot again, so a depot that recovers is used again
+  immediately.
 - Answers are cached to spare the depot. A cached answer is only valid for the **exact
   site + skill pair it was fetched for** — the `certified` and `general` pools at one site
   have independent capacity and must never be served each other's number.
@@ -183,11 +186,14 @@ still free today for a **site *and* skill pool** pair.
   handler raises → `-32000`.
 - **Notifications.** A request object **without an `id` member** is a notification: the
   server does the work but sends **no response at all** — HTTP `204` with an empty body.
-  Note that this is about the *absence* of the member, not about `id: null`.
+  Note that this is about the *absence* of the member, not about `id: null`. A request
+  that carries `"id": null` is an **ordinary request** and gets a full envelope back, with
+  `"id": null` echoed in it.
 - **Batches.** The body may be a JSON **array** of request objects. The server processes
   them and replies with an array of response objects — one per non-notification member, in
-  request order. If every member is a notification, it replies HTTP `204` with an empty
-  body. An **empty array** is an Invalid Request → a single `-32600` error object.
+  **request order**, regardless of how long any individual member took to run. If every
+  member is a notification, it replies HTTP `204` with an empty body. An **empty array**
+  is an Invalid Request → a single `-32600` error object.
 
 ---
 

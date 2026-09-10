@@ -82,6 +82,16 @@ async def test_error_response_reports_no_capacity(monkeypatch):
     assert await client.free_minutes("EEE-01", "certified") == 0
 
 
+async def test_a_failed_lookup_is_not_cached(monkeypatch):
+    client = AvailabilityClient(base_url=DEPOT_URL, cache={})
+
+    _fails(monkeypatch, client)
+    assert await client.free_minutes("FFF-01", "certified") == 0
+
+    _answers(monkeypatch, client, 240)
+    assert await client.free_minutes("FFF-01", "certified") == 240
+
+
 async def test_ticket_is_queued_when_the_depot_is_down(monkeypatch):
     client = AvailabilityClient(base_url=DEPOT_URL, cache={})
     _fails(monkeypatch, client)

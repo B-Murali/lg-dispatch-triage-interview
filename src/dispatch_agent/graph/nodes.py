@@ -66,9 +66,9 @@ async def validate(state: DispatchState) -> DispatchState:
 
     state["audit"].append("validate")
 
-    logger.info("validated ticket asset=%s", state.get("asset_id"))
+    logger.info("validated ticket asset=%s errors=%d", state.get("asset_id"), len(errors))
 
-    return {"errors": errors, "audit": state["audit"]}
+    return {"audit": state["audit"]}
 
 
 async def triage(state: DispatchState) -> DispatchState:
@@ -178,12 +178,15 @@ async def finalize(state: DispatchState) -> DispatchState:
 
 
 def route_after_triage(state: DispatchState) -> str:
+    """Short-circuit rule: anything already known to be undispatchable skips the depot."""
+    if state.get("errors"):
+        return "reject"
     if not state.get("serviceable", False):
         return "reject"
     return "assess"
 
 
 def route_after_capacity(state: DispatchState) -> str:
-    if state.get("has_capacity", False):
+    if state.get("free_minutes", 0) >= state.get("estimated_minutes", 0):
         return "assign"
     return "queue"

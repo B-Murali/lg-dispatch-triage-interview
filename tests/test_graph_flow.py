@@ -85,6 +85,24 @@ async def test_oversized_job_never_auto_dispatches():
     result = await triage_ticket(ticket(estimated_minutes=300))
 
     assert result["decision"] == "needs_scheduling"
+    assert result["technician_id"] == ""
+
+
+async def test_capacity_buffer_is_respected(depot_reporting):
+    depot_reporting(110)  # 90 minutes of work needs 90 + 30 free
+
+    result = await triage_ticket(ticket(estimated_minutes=90))
+
+    assert result["decision"] == "needs_scheduling"
+    assert result["technician_id"] == ""
+
+
+async def test_job_at_the_auto_dispatch_ceiling_still_dispatches(depot_reporting):
+    depot_reporting(480)
+
+    result = await triage_ticket(ticket(estimated_minutes=240))
+
+    assert result["decision"] == "auto_dispatch"
 
 
 @pytest.mark.parametrize(

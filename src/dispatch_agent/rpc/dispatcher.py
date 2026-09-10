@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -46,6 +47,11 @@ def _read_id(raw: Any) -> str | int | None:
     return None
 
 
+def _is_notification(raw: Any) -> bool:
+    """A notification is a request the caller wants no reply to."""
+    return isinstance(raw, dict) and raw.get("id") is None
+
+
 def _invalid_request_reason(raw: Any) -> str | None:
     """Return why `raw` is not a valid JSON-RPC request object, or None if it is."""
     if not isinstance(raw, dict):
@@ -59,24 +65,50 @@ def _invalid_request_reason(raw: Any) -> str | None:
     return None
 
 
-async def dispatch(raw: Any) -> dict[str, Any]:
-    """Execute a single JSON-RPC call and return the response envelope."""
+async def dispatch(raw: Any) -> dict[str, Any] | None:
+    """Execute a single JSON-RPC call.
+
+    Returns the response envelope, or `None` when the call was a notification and
+    the caller must receive no reply at all.
+    """
     reason = _invalid_request_reason(raw)
     if reason is not None:
         return failure(_read_id(raw), INVALID_REQUEST, "Invalid Request", reason)
 
     request = JsonRpcRequest(**raw)
+    quiet = _is_notification(raw)
 
     handler = _REGISTRY.get(request.method)
     if handler is None:
+        if quiet:
+            return None
         return failure(request.id, METHOD_NOT_FOUND, f"Unknown method: {request.method}")
 
     try:
         result = await handler(request.params)
     except (KeyError, TypeError) as exc:
+        if quiet:
+            return None
         return failure(request.id, INVALID_PARAMS, "Invalid params", str(exc))
     except Exception as exc:
         logger.exception("rpc handler failed method=%s", request.method)
+        if quiet:
+            return None
         return failure(request.id, SERVER_ERROR, str(exc), repr(exc))
 
+    if quiet:
+        return None
     return success(request.id, result)
+
+
+async def dispatch_batch(raws: list[Any]) -> list[dict[str, Any]]:
+    """Execute a batch of calls, dropping the members that expect no reply."""
+    tasks = [asyncio.create_task(dispatch(raw)) for raw in raws]
+
+    responses: list[dict[str, Any]] = []
+    for finished in asyncio.as_completed(tasks):
+        response = await finished
+        if response is not None:
+            responses.append(response)
+
+    return responses

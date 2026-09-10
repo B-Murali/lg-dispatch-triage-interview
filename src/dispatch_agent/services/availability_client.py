@@ -15,13 +15,17 @@ logger = logging.getLogger(__name__)
 class AvailabilityClient:
     """Fetches the free technician minutes left today for a site + skill pool."""
 
-    def __init__(self, base_url: str | None = None, cache: dict[str, int] = {}) -> None:
+    # site+skill -> free minutes, so repeat tickets do not re-ask the depot.
+    cache: dict[str, int] = {}
+
+    def __init__(self, base_url: str | None = None, cache: dict[str, int] | None = None) -> None:
         self.base_url = base_url or settings.availability_service_url
-        self.cache = cache
+        if cache is not None:
+            self.cache = cache
         self._client = httpx.AsyncClient(timeout=5.0)
 
     async def free_minutes(self, site_code: str, skill: str) -> int:
-        key = site_code
+        key = f"{site_code}:{skill}"
         if key in self.cache:
             return self.cache[key]
 
@@ -38,7 +42,7 @@ class AvailabilityClient:
                 site_code,
                 skill,
             )
-            return 0
+            minutes = 0
 
         self.cache[key] = minutes
         return minutes

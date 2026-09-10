@@ -120,6 +120,27 @@ def test_notification_still_does_the_work():
     assert "TCK-RPC" in dispatch_service._RESULTS
 
 
+def test_explicit_null_id_is_an_ordinary_request():
+    response = call({"jsonrpc": "2.0", "id": None, "method": "dispatch.policy"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] is None
+    assert body["result"]["intake_window_hours"] == 72
+
+
+def test_batch_keeps_an_explicit_null_id_member():
+    response = call(
+        [
+            {"jsonrpc": "2.0", "id": None, "method": "dispatch.policy"},
+            request("agent.describe", id="b-9"),
+        ]
+    )
+
+    body = response.json()
+    assert [item["id"] for item in body] == [None, "b-9"]
+
+
 # ---------------------------------------------------------------------------
 # batches
 # ---------------------------------------------------------------------------
@@ -166,3 +187,29 @@ def test_empty_batch_is_invalid_request():
     body = response.json()
     assert isinstance(body, dict)
     assert body["error"]["code"] == -32600
+
+
+def test_batch_keeps_request_order_when_a_call_is_slow():
+    response = call(
+        [
+            request("dispatch.triage", {**TICKET, "ticket_id": "TCK-SLOW"}, id="b-5"),
+            request("dispatch.policy", id="b-6"),
+        ]
+    )
+
+    body = response.json()
+    assert [item["id"] for item in body] == ["b-5", "b-6"]
+    assert body[0]["result"]["ticket_id"] == "TCK-SLOW"
+
+
+def test_batch_order_survives_notifications_and_slow_calls():
+    response = call(
+        [
+            request("dispatch.triage", {**TICKET, "ticket_id": "TCK-SLOW-2"}, id="b-7"),
+            notification("agent.describe"),
+            request("dispatch.policy", id="b-8"),
+        ]
+    )
+
+    body = response.json()
+    assert [item["id"] for item in body] == ["b-7", "b-8"]

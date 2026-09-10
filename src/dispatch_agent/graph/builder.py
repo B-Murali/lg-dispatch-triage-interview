@@ -40,7 +40,7 @@ def build_graph() -> StateGraph:
         },
     )
 
-    graph.add_edge("assign_technician", END)
+    graph.add_edge("assign_technician", "finalize")
     graph.add_edge("queue_for_scheduling", "finalize")
     graph.add_edge("finalize", END)
 

@@ -23,7 +23,7 @@ uv sync --extra dev
 uv run pytest -q
 ```
 
-You should see **14 failed, 30 passed**. Each part below covers one defect area, with the
+You should see **11 failed, 40 passed**. Each part below covers one defect area, with the
 failing tests already written against it. The three areas are independent and live in
 different layers, so you can work them in any order and watch the failure count drop.
 
@@ -45,102 +45,112 @@ Two different tickets come out of the graph having walked a path the README does
 describe. The `audit` list is your microscope: it records every node that actually ran, in
 order.
 
-### Symptom A — a booked ticket is never actually decided
+### Symptom A — the capacity rule is only half applied
 
-A clean, serviceable ticket, at a site with plenty of free depot capacity. A technician
-*is* reserved and the SLA *is* stamped — and yet the caller gets this back:
+`capacity_check` is where the README's capacity rule lives. Both clauses must hold before a
+ticket is booked: `free_minutes >= estimated_minutes + CAPACITY_BUFFER_MINUTES`, **and**
+`estimated_minutes <= MAX_AUTO_DISPATCH_MINUTES` (240). Two tickets say otherwise:
 
 ```jsonc
-// request
-{ "issue_code": "NO_POWER", "estimated_minutes": 90,
-  "site_code": "SFO-02",    "reported_hours_ago": 4 }     // depot has 480 free minutes
+// 1. no slack left — the buffer clause should have queued this
+{ "estimated_minutes": 90 }        // depot reports 110 free; the rule wants 90 + 30 = 120
+→ { "decision": "auto_dispatch", "technician_id": "SFO-02-CERTIFIED-01" }   // ✗
 
-// response
-{
-  "decision":      "pending",              // ✗ README says "auto_dispatch"
-  "technician_id": "SFO-02-CERTIFIED-01",  // ✓ somebody was booked
-  "sla_minutes":   60,                     // ✓ the clock was set
-  "rejection_reason": "",
-  "audit": [ … ]                           // ← read this. it is shorter than it should be
-}
+// 2. a full-day job — the job-size clause should have queued this
+{ "estimated_minutes": 300 }       // depot reports 480 free; ceiling is 240
+→ { "decision": "auto_dispatch", "technician_id": "SFO-02-CERTIFIED-01" }   // ✗
 ```
 
-`"pending"` is the *initial* value the service seeds state with before the graph runs. The
-orchestrator downstream branches on `decision`, so a ticket in this shape holds a
-technician that no system will ever recognise as booked.
+Both come back `auto_dispatch` with a technician attached. The pattern behind them: the
+branch is taken whenever the depot's raw number merely covers the job. The buffer is gone
+and the ceiling is gone — the depot's last 20 minutes of slack get promised away, and a
+five-hour job is booked as if it were routine.
 
-> Hint: `audit` records every node that actually ran, in order. Compare the audit you get
-> for this ticket against the audit for a ticket that gets **queued** instead of booked —
-> the two paths are supposed to differ by exactly one node. Then compare both against the
-> mermaid diagram in README §"Decision flow" and ask which node stamps `decision`.
+Note what is *not* wrong. `free_minutes` in the response is the depot's real number, and
+`capacity_check` itself evaluates both clauses correctly — set a breakpoint in it and you
+will watch it get the right answer.
+
+> Hint: `capacity_check` computes the verdict; a separate router function chooses the
+> branch. Ask what `capacity_check` puts into state for that decision, then grep for who
+> reads it. If the answer is "nobody", you have found a second, drifted copy of a rule that
+> is supposed to live in exactly one place — and the fix is to delete the copy, not to
+> patch it.
 
 ### Symptom B — a junk ticket goes shopping for a technician
 
-A ticket with an empty `asset_id` is invalid. `validate` notices it and records the error,
-and the ticket does come back `rejected` with the right reason. So far so good.
-
-The problem is what happens on the way there. The README's **short-circuit rule** says an
-invalid ticket goes straight to `finalize`; it must never reach `capacity_check`, because a
-malformed ticket must not burn a downstream depot lookup or momentarily hold a technician
-slot that a real ticket could have used.
+A ticket with an empty `asset_id` is invalid, and `validate` does spot it — the node
+computes exactly the right error string. But the ticket does not come back `rejected`; it
+sails on to `capacity_check`, burns a depot lookup, and comes out the far end as an
+ordinary undecided-but-serviceable work order.
 
 ```
-   ticket: asset_id = ""        ← we already know this is garbage
+   ticket: asset_id = ""        ← validate knows this is garbage
 
    📡  the depot receives an availability lookup for it anyway
    🔧  and the ticket carries on through nodes that only real work should reach
+   📄  rejection_reason comes back empty — as if nothing was ever wrong
 
-   the verdict is right; the road taken to reach it is not
    (the test asserts the depot is never called — and counts the calls)
 ```
 
-> Hint: routing in this graph is done by plain functions that read state and return a
-> branch name. `validate` runs before them and leaves something behind in state. Ask
-> whether anything downstream ever looks at it before deciding where to go next — and note
-> that `finalize` reading it at the very end is not the same as the graph acting on it.
+The README's **short-circuit rule** says an invalid ticket goes straight to `finalize` with
+an audit of exactly `["validate", "triage", "finalize"]`, because a malformed ticket must
+not burn a downstream depot lookup or momentarily hold a technician slot that a real ticket
+could have used.
+
+> Hint: the router that implements the short-circuit is right there in `nodes.py` and reads
+> correctly — take it at its word and ask instead whether the thing it reads ever arrives.
+> A LangGraph node does not mutate state in place; the dict it **returns** is the update
+> that gets merged. Anything a node computes and does not return never happened as far as
+> the rest of the graph is concerned. Print the state your node returns, not the state it
+> holds.
 
 ### What must hold when you are done
 
 | Ticket | `decision` | `audit` |
 |---|---|---|
 | `NO_POWER`, 90 min, depot 480 free | `auto_dispatch` | `validate, triage, capacity_check, assign_technician, finalize` |
-| `NO_POWER`, 90 min, depot 100 free | `needs_scheduling` | `validate, triage, capacity_check, queue_for_scheduling, finalize` |
+| `NO_POWER`, 90 min, depot 110 free | `needs_scheduling` | `validate, triage, capacity_check, queue_for_scheduling, finalize` |
+| `NO_POWER`, 300 min, depot 480 free | `needs_scheduling` | `validate, triage, capacity_check, queue_for_scheduling, finalize` |
 | `asset_id=""` | `rejected` | `validate, triage, finalize` |
 | `WARRANTY_QUESTION` | `rejected` | `validate, triage, finalize` |
 
-**Relevant tests:** `tests/test_graph_flow.py` — `test_dispatched_ticket_reaches_a_terminal_decision`,
-`test_dispatched_ticket_runs_every_node_in_order`, `test_technician_comes_from_the_right_pool`,
+**Relevant tests:** `tests/test_graph_flow.py` — `test_thin_capacity_queues_the_ticket`,
+`test_capacity_buffer_is_respected`, `test_oversized_job_never_auto_dispatches`,
 `test_invalid_ticket_is_rejected_without_calling_the_depot`, `test_invalid_duration_is_rejected`.
+`test_dispatched_ticket_runs_every_node_in_order` and
+`test_job_at_the_auto_dispatch_ceiling_still_dispatches` are green — keep them that way.
 
 ---
 
 
-## Part 2 — The depot gives out the wrong number (≈25 min)
+## Part 2 — The depot cache remembers the wrong things (≈25 min)
 
 **Layer:** `src/dispatch_agent/services/availability_client.py`
 
 Every site runs **two independent technician pools** — `certified` (safety and urgent work)
 and `general` (routine work). They have separate capacity. `capacity_check` asks the depot
-for the free minutes of one specific *site + pool* pair, and answers are cached to spare
-the downstream service.
+for the free minutes of one specific *site + pool* pair, and answers are cached to spare the
+downstream service.
 
 Two things go wrong, and they share a home in this one file.
 
-### Symptom A — one pool answers for the other
+### Symptom A — a blip becomes permanent
+
+The fail-closed rule is deliberate: an unusable depot means `0` free minutes, so the ticket
+falls through to `needs_scheduling` rather than booking a technician on a guess. What is not
+deliberate is how long that `0` sticks around.
 
 ```
- site SFO-02 today
- ┌──────────────────────────┬──────────────────────────┐
- │  certified pool          │  general pool            │
- │  240 free minutes        │   30 free minutes        │
- └──────────────────────────┴──────────────────────────┘
-
-   ask for (SFO-02, certified)  →  240   ✓
-   ask for (SFO-02, general)    →  240   ✗   the depot's real answer is 30
+  09:00  depot times out         →  (SFO-02, certified) = 0    ✓ fail closed, correct
+  09:01  depot is healthy again  →  (SFO-02, certified) = 0    ✗ depot says 480
+  17:00  depot still healthy     →  (SFO-02, certified) = 0    ✗ and never asked again
 ```
 
-A routine job at that site now looks like it has 240 minutes of general-pool capacity it
-does not have, and gets auto-dispatched into a pool that is already full.
+The depot is never contacted again for that pair for the life of the process. Every safety
+ticket at that site is queued for a human all afternoon because of one timeout at nine in
+the morning. README §"Availability lookups" is explicit: `0` is a fallback, not an answer,
+and must never be remembered.
 
 ### Symptom B — a brand-new client is born already knowing things
 
@@ -153,106 +163,114 @@ does not have, and gets auto-dispatched into a pool that is already full.
 
 Two `AvailabilityClient` instances are supposed to be independent — including the
 long-lived one the graph itself holds. Today something written through one is visible
-through the other.
+through the other, even though `__init__` reads as though every client gets its own.
 
 > Hint: both symptoms are visible in `AvailabilityClient` alone — no graph, no network.
-> Instantiate one in a REPL, hand it a stub, and print the client's own state after each
-> lookup. Two questions will fall out of what you see: *what exactly identifies a stored
-> answer*, and *who else can reach the thing that stores it*.
+> Instantiate two in a REPL, hand each a stub, and after every lookup print what each
+> client has stored — then ask whether `a.cache is b.cache`. Two questions fall out of what
+> you see: *which values deserve to be stored at all*, and *whose dictionary is actually
+> being written to when the caller passed none in*.
 
 ### Already correct — do not "fix" these
 
-The failure behaviour is deliberate and specified in README §"Availability lookups": an
-unreachable or erroring depot **fails closed** and reports `0` free minutes, so the ticket
-falls through to `needs_scheduling`. Three green tests guard this. Keep them green.
+The failure behaviour itself is specified in README §"Availability lookups": an unreachable
+or erroring depot **fails closed** and reports `0` free minutes, so the ticket falls through
+to `needs_scheduling`. Green tests guard this. Keep them green — the defect is that the `0`
+is remembered, not that it is returned.
 
 | Scenario | Expected |
 |---|---|
-| `(AAA-01, certified)` = 240, then `(AAA-01, general)` = 30 | second lookup returns `30` |
+| depot fails once, then recovers | second lookup returns the depot's **real** number |
 | client A caches `(BBB-01, certified)`; fresh client B looks it up | B returns **its own** depot's answer |
+| `(AAA-01, certified)` = 240, then `(AAA-01, general)` = 30 | second lookup returns `30` |
 | same pair looked up twice on one client | second call served from cache, no second HTTP call |
 | depot unreachable / answers `503` | `0` free minutes |
 | triage while the depot is down | `needs_scheduling`, `technician_id` empty |
 
-**Relevant tests:** `tests/test_availability_client.py` — `test_skill_is_part_of_the_cache_key`,
-`test_each_client_keeps_its_own_cache` (failing); `test_repeated_lookup_is_served_from_cache`,
-`test_unreachable_depot_reports_no_capacity`, `test_error_response_reports_no_capacity`,
-`test_ticket_is_queued_when_the_depot_is_down` (green — keep them that way).
+**Relevant tests:** `tests/test_availability_client.py` — `test_a_failed_lookup_is_not_cached`,
+`test_each_client_keeps_its_own_cache` (failing); `test_skill_is_part_of_the_cache_key`,
+`test_repeated_lookup_is_served_from_cache`, `test_unreachable_depot_reports_no_capacity`,
+`test_error_response_reports_no_capacity`, `test_ticket_is_queued_when_the_depot_is_down`
+(green — keep them that way).
 
 ---
 
-## Part 3 — The wire protocol is only half-implemented (≈25 min)
+## Part 3 — The wire protocol is subtly off-spec (≈25 min)
 
 **Layer:** `src/dispatch_agent/rpc/` and `src/dispatch_agent/api.py`
 
-The parent orchestrator speaks strict JSON-RPC 2.0. Single calls work fine today. Two other
-shapes of traffic, both described in README §"JSON-RPC contract", do not.
+The parent orchestrator speaks strict JSON-RPC 2.0. Single calls, notifications and batches
+all appear to work — the obvious tests are green. Two shapes of real traffic, both described
+in README §"JSON-RPC contract", still come back wrong.
 
-### Symptom A — fire-and-forget still gets an answer
+### Symptom A — a request is silently mistaken for a notification
 
 The orchestrator sends low-priority tickets as **notifications**: a request object with
-**no `id` member at all**. Per the spec, the server does the work and replies with
-*nothing*.
+**no `id` member at all**. Per the spec, the server does the work and replies with nothing.
+That much works.
+
+But some of its clients serialise a real, answer-me request with an explicit `"id": null`
+(a JSON encoder that emits every field). The spec is precise about the difference: a
+**missing** `id` member is a notification; an `id` that is *present and null* is an ordinary
+request, and gets an ordinary envelope back with `"id": null` echoed in it.
 
 ```
-  ──→  {"jsonrpc":"2.0","method":"dispatch.triage","params":{…}}      ← no "id"
+  ──→  {"jsonrpc":"2.0","id":null,"method":"dispatch.policy"}     ← "id" IS present
+
+  EXPECTED                                OBSERVED
+  ────────────────────────────────        ────────────────
+  HTTP 200                                HTTP 204
+  {"jsonrpc":"2.0","id":null,             (empty body)
+   "result":{…}}                          the caller waits for a policy
+                                          it will never be sent
+```
+
+The same confusion drops that member from a **batch** array, so the caller gets back fewer
+responses than it sent calls and cannot line them up.
+
+> Hint: by the time a JSON-RPC request has become a `JsonRpcRequest`, `id` is `None` in
+> both cases — pydantic filled in the default and the distinction is gone. Whatever answers
+> "does this caller want a reply?" has to be asked of something that still knows what the
+> client actually sent.
+
+### Symptom B — a batch comes back shuffled
+
+The orchestrator groups calls into a **batch** and matches responses to requests **by
+position**. The array it gets back is the right length and every envelope is individually
+correct — but a batch containing a real `dispatch.triage` (which does downstream work and
+takes tens of milliseconds) next to a cheap `dispatch.policy` comes back the other way
+round.
+
+```
+  ──→  [ {id:"b-5", method:"dispatch.triage", …},   ← slow
+         {id:"b-6", method:"dispatch.policy"} ]     ← fast
 
   EXPECTED                          OBSERVED
-  ────────────────────              ─────────────────────────────────────────
-  HTTP 204                          HTTP 200
-  (empty body)                      {"jsonrpc":"2.0","id":null,"result":{…}}
-                                                        ▲
-                                                        └── an id that was
-                                                            never sent
+  ──────────────────────────        ─────────────────────────────
+  [ {id:"b-5", result:{…}},         [ {id:"b-6", result:{…}},
+    {id:"b-6", result:{…}} ]          {id:"b-5", result:{…}} ]
+
+  a batch of equally cheap calls looks fine — which is why nobody noticed
 ```
 
-Note the distinction the spec draws: a **missing** `id` member is a notification;
-an `id` that is *present and null* is an ordinary request. The work itself must still
-happen either way.
+The README requires responses **in request order, regardless of how long any individual
+member took to run**. A parent that zips its request list against this array attributes a
+triage decision to the wrong ticket.
 
-### Symptom B — a batch takes the whole endpoint down
-
-The orchestrator also groups calls into a **batch**: a JSON array of request objects,
-answered with an array of responses in the same order, with notifications left out.
-
-```
-  ──→  [ {id:"b-3", method:"dispatch.policy"},
-         {        method:"agent.describe"},     ← notification
-         {id:"b-4", method:"dispatch.nope"} ]
-
-  EXPECTED                                   OBSERVED
-  ─────────────────────────────────────      ────────────────────────
-  HTTP 200                                   HTTP 500
-  [ {id:"b-3", result:{…}},                  (unhandled exception,
-    {id:"b-4", error:{code:-32601}} ]         no JSON-RPC envelope
-                                              at all)
-  └─ two entries: the notification
-     contributes nothing
-```
-
-Three batch shapes have to behave:
-
-| Body | Expected |
-|---|---|
-| array of 2 ordinary calls | HTTP 200, array of 2 responses, ids in request order |
-| array mixing calls and notifications | HTTP 200, array with **only** the non-notification responses |
-| array where every member is a notification | HTTP 204, empty body |
-| `[]` (empty array) | HTTP 200, a **single** error object, `code = -32600` |
-
-> Hint: start at `POST /rpc` in `api.py` and follow the body. It is handed to the
-> dispatcher assuming exactly one shape. Ask what the endpoint does before it knows what it
-> is holding, and what a handler's return value should be when the caller asked for no
-> reply. FastAPI will happily return an empty `204` if you give it the right object.
+> Hint: the batch path fans the calls out concurrently, which is correct and worth keeping.
+> Look at how the results are collected back in, and ask what ordering that particular
+> `asyncio` helper promises. Concurrency and ordering are separable: there is a one-line
+> way to keep the first and fix the second.
 
 ### Do not change the happy path
 
-`test_triage_over_rpc`, `test_policy_method`, `test_agent_describe`, the two
-envelope-shape tests, and the three `-32600` malformed-request tests are green today and
-must stay green.
+`test_triage_over_rpc`, `test_policy_method`, `test_agent_describe`, the two envelope-shape
+tests, the three `-32600` malformed-request tests, the two notification tests and the four
+existing batch tests are green today and must stay green.
 
-**Relevant tests:** `tests/test_rpc.py` — `test_notification_gets_no_response_body`,
-`test_batch_returns_one_response_per_call`, `test_batch_omits_notifications`,
-`test_batch_of_only_notifications_gets_no_response_body`, `test_empty_batch_is_invalid_request`.
+**Relevant tests:** `tests/test_rpc.py` — `test_explicit_null_id_is_an_ordinary_request`,
+`test_batch_keeps_an_explicit_null_id_member`, `test_batch_keeps_request_order_when_a_call_is_slow`,
+`test_batch_order_survives_notifications_and_slow_calls`.
 
 ---
 
@@ -283,6 +301,6 @@ Create `FINDINGS.md` containing:
 
 ## Deliverables
 
-- A green `uv run pytest -q` (44 passed).
+- A green `uv run pytest -q` (51 passed).
 - `FINDINGS.md`.
 - Clean, reviewable commits.
